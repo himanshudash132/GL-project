@@ -1,9 +1,11 @@
 # ============================================================
-# SuperKart Sales Prediction - Streamlit Application
+# SuperKart Sales Forecasting Application
+# Standalone Streamlit deployment
 # ============================================================
 
 from pathlib import Path
-from typing import List, Tuple
+import io
+import json
 
 import joblib
 import numpy as np
@@ -12,20 +14,26 @@ import streamlit as st
 
 
 # ============================================================
-# 1. Application Configuration
+# 1. Application configuration
 # ============================================================
 
 st.set_page_config(
-    page_title="SuperKart Sales Predictor",
+    page_title="SuperKart Sales Forecasting",
     page_icon="🛒",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 
-MODEL_FILE = "superkart_model.joblib"
-METADATA_FILE = "superkart_model_metadata.json"
-PREDICTION_COLUMN = "Predicted_Product_Store_Sales_Total"
+APP_TITLE = "SuperKart Sales Forecasting System"
+TARGET_NAME = "Product_Store_Sales_Total"
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "superkart_model.joblib"
+METADATA_PATH = BASE_DIR / "superkart_model_metadata.json"
+
+MAX_BATCH_ROWS = 10_000
+
 
 EXPECTED_FEATURES = [
     "Product_Weight",
@@ -40,12 +48,14 @@ EXPECTED_FEATURES = [
     "Product_Type_Category",
 ]
 
+
 NUMERICAL_FEATURES = [
     "Product_Weight",
     "Product_Allocated_Area",
     "Product_MRP",
     "Store_Age_Years",
 ]
+
 
 CATEGORICAL_FEATURES = [
     "Product_Sugar_Content",
@@ -57,577 +67,331 @@ CATEGORICAL_FEATURES = [
 ]
 
 
+CATEGORY_OPTIONS = {
+    "Product_Sugar_Content": [
+        "Low Sugar",
+        "Regular",
+        "No Sugar",
+    ],
+    "Store_Size": [
+        "Small",
+        "Medium",
+        "High",
+    ],
+    "Store_Location_City_Type": [
+        "Tier 1",
+        "Tier 2",
+        "Tier 3",
+    ],
+    "Store_Type": [
+        "Departmental Store",
+        "Supermarket Type1",
+        "Supermarket Type2",
+        "Food Mart",
+    ],
+    "Product_Id_char": [
+        "FD",
+        "DR",
+        "NC",
+    ],
+    "Product_Type_Category": [
+        "Perishables",
+        "Non Perishables",
+    ],
+}
+
+
 # ============================================================
-# 2. Styling
+# 2. Model and metadata loading
 # ============================================================
 
-st.markdown(
+@st.cache_resource(show_spinner=False)
+def load_model(model_path: Path):
     """
-    <style>
-        .main-title {
-            font-size: 2.3rem;
-            font-weight: 700;
-            color: #1565C0;
-            margin-bottom: 0.2rem;
-        }
+    Load the complete serialized preprocessing and regression pipeline.
 
-        .sub-title {
-            font-size: 1.05rem;
-            color: #555555;
-            margin-bottom: 1.5rem;
-        }
-
-        .prediction-box {
-            padding: 1.4rem;
-            border-radius: 12px;
-            background-color: #E8F5E9;
-            border: 1px solid #66BB6A;
-            text-align: center;
-            margin-top: 1rem;
-        }
-
-        .prediction-value {
-            font-size: 2rem;
-            font-weight: 700;
-            color: #1B5E20;
-        }
-
-        .info-box {
-            padding: 1rem;
-            border-radius: 10px;
-            background-color: #E3F2FD;
-            border-left: 5px solid #1976D2;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# 3. Model-Loading Function
-# ============================================================
-
-@st.cache_resource
-def load_model():
+    The model is cached so that it is not loaded again after every
+    Streamlit interaction.
     """
-    Load the serialized preprocessing and machine-learning pipeline.
-
-    The model is loaded only once and cached by Streamlit.
-    """
-
-    base_directory = Path(__file__).resolve().parent
-    model_path = base_directory / MODEL_FILE
-
     if not model_path.exists():
         raise FileNotFoundError(
-            f"'{MODEL_FILE}' was not found. "
-            "Place the model file in the same folder as app.py."
+            f"Model file '{model_path.name}' was not found. "
+            "Place superkart_model.joblib in the same directory as app.py."
+        )
+
+    if model_path.stat().st_size == 0:
+        raise ValueError(
+            f"Model file '{model_path.name}' exists but is empty."
         )
 
     loaded_model = joblib.load(model_path)
 
     if not hasattr(loaded_model, "predict"):
         raise TypeError(
-            "The loaded file does not contain a valid prediction model."
+            "The loaded model does not provide a predict() method."
         )
 
     return loaded_model
 
 
-# ============================================================
-# 4. Metadata-Loading Function
-# ============================================================
-
-@st.cache_data
-def load_metadata():
-    """
-    Load optional model metadata.
-
-    The app will continue working if the metadata file is unavailable.
-    """
-
-    import json
-
-    base_directory = Path(__file__).resolve().parent
-    metadata_path = base_directory / METADATA_FILE
-
+@st.cache_data(show_spinner=False)
+def load_metadata(metadata_path: Path):
+    """Load optional model metadata without stopping the application."""
     if not metadata_path.exists():
         return {}
 
     try:
-        with open(metadata_path, "r", encoding="utf-8") as file:
-            metadata = json.load(file)
+        with metadata_path.open("r", encoding="utf-8") as metadata_file:
+            metadata = json.load(metadata_file)
 
-        return metadata if isinstance(metadata, dict) else {}
+        if isinstance(metadata, dict):
+            return metadata
+
+        return {}
 
     except (OSError, json.JSONDecodeError):
         return {}
 
 
+try:
+    model = load_model(MODEL_PATH)
+    model_metadata = load_metadata(METADATA_PATH)
+    MODEL_AVAILABLE = True
+    MODEL_ERROR = None
+
+except Exception as error:
+    model = None
+    model_metadata = {}
+    MODEL_AVAILABLE = False
+    MODEL_ERROR = str(error)
+
+
 # ============================================================
-# 5. Input Validation Functions
+# 3. Validation functions
 # ============================================================
 
-def validate_schema(data: pd.DataFrame) -> Tuple[bool, List[str]]:
+def validate_feature_schema(dataframe: pd.DataFrame):
     """
-    Check whether all required model input columns are present.
-    """
+    Validate the required input columns.
 
+    Returns:
+        missing_columns, unexpected_columns
+    """
     missing_columns = [
         column
         for column in EXPECTED_FEATURES
-        if column not in data.columns
+        if column not in dataframe.columns
     ]
 
-    return len(missing_columns) == 0, missing_columns
+    unexpected_columns = [
+        column
+        for column in dataframe.columns
+        if column not in EXPECTED_FEATURES
+    ]
+
+    return missing_columns, unexpected_columns
 
 
-def prepare_input_data(data: pd.DataFrame) -> pd.DataFrame:
+def prepare_input_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
     """
-    Validate, clean and arrange incoming data for prediction.
+    Validate and prepare raw input data for the serialized pipeline.
+
+    No imputation, encoding, or scaling is performed here because
+    those transformations are already included in the saved pipeline.
     """
+    if not isinstance(dataframe, pd.DataFrame):
+        raise TypeError("Input must be supplied as a pandas DataFrame.")
 
-    is_valid, missing_columns = validate_schema(data)
+    if dataframe.empty:
+        raise ValueError("The input dataset is empty.")
 
-    if not is_valid:
+    if dataframe.columns.duplicated().any():
+        duplicate_columns = dataframe.columns[
+            dataframe.columns.duplicated()
+        ].tolist()
+
+        raise ValueError(
+            f"Duplicate columns detected: {duplicate_columns}"
+        )
+
+    missing_columns, unexpected_columns = validate_feature_schema(dataframe)
+
+    if missing_columns:
         raise ValueError(
             "The following required columns are missing: "
             + ", ".join(missing_columns)
         )
 
-    prepared_data = data[EXPECTED_FEATURES].copy()
+    prepared_data = dataframe[EXPECTED_FEATURES].copy()
 
-    # Convert numerical columns to numeric values.
+    # Convert numerical variables safely.
     for column in NUMERICAL_FEATURES:
         prepared_data[column] = pd.to_numeric(
             prepared_data[column],
             errors="coerce",
         )
 
-    # Check for missing or invalid numerical values.
-    invalid_numeric_columns = [
-        column
-        for column in NUMERICAL_FEATURES
-        if prepared_data[column].isna().any()
-    ]
-
-    if invalid_numeric_columns:
-        raise ValueError(
-            "Invalid or missing numerical values were found in: "
-            + ", ".join(invalid_numeric_columns)
-        )
-
-    # Check for infinite numerical values.
-    finite_values = np.isfinite(
-        prepared_data[NUMERICAL_FEATURES].to_numpy(dtype=float)
-    )
-
-    if not finite_values.all():
-        raise ValueError(
-            "Numerical columns cannot contain infinite values."
-        )
-
-    # Clean categorical columns.
+    # Clean categorical values without encoding them.
     for column in CATEGORICAL_FEATURES:
-        prepared_data[column] = (
-            prepared_data[column]
-            .astype("string")
-            .str.strip()
+        prepared_data[column] = prepared_data[column].apply(
+            lambda value: (
+                value.strip()
+                if isinstance(value, str)
+                else value
+            )
         )
 
-    # Standardize known sugar-content variations.
+    # Standardize known equivalent sugar-content labels.
+    sugar_mapping = {
+        "reg": "Regular",
+        "Reg": "Regular",
+        "REG": "Regular",
+        "regular": "Regular",
+        "Regular": "Regular",
+        "low sugar": "Low Sugar",
+        "Low sugar": "Low Sugar",
+        "LOW SUGAR": "Low Sugar",
+        "no sugar": "No Sugar",
+        "No sugar": "No Sugar",
+        "NO SUGAR": "No Sugar",
+    }
+
     prepared_data["Product_Sugar_Content"] = (
-        prepared_data["Product_Sugar_Content"].replace(
-            {
-                "reg": "Regular",
-                "Reg": "Regular",
-                "REG": "Regular",
-                "regular": "Regular",
-                "low sugar": "Low Sugar",
-                "no sugar": "No Sugar",
-            }
+        prepared_data["Product_Sugar_Content"]
+        .replace(sugar_mapping)
+    )
+
+    # Ensure that numerical values are finite.
+    numeric_array = prepared_data[NUMERICAL_FEATURES].to_numpy(
+        dtype=float
+    )
+
+    if np.isinf(numeric_array).any():
+        raise ValueError(
+            "Infinite numerical values are not allowed."
+        )
+
+    # Business-rule validations.
+    invalid_weight = (
+        prepared_data["Product_Weight"].notna()
+        & (prepared_data["Product_Weight"] <= 0)
+    )
+
+    if invalid_weight.any():
+        invalid_rows = prepared_data.index[invalid_weight].tolist()
+
+        raise ValueError(
+            "Product_Weight must be greater than zero. "
+            f"Invalid row indices: {invalid_rows[:10]}"
+        )
+
+    invalid_area = (
+        prepared_data["Product_Allocated_Area"].notna()
+        & (
+            (prepared_data["Product_Allocated_Area"] < 0)
+            | (prepared_data["Product_Allocated_Area"] > 1)
         )
     )
 
-    # Check for blank categorical values.
+    if invalid_area.any():
+        invalid_rows = prepared_data.index[invalid_area].tolist()
+
+        raise ValueError(
+            "Product_Allocated_Area must be between 0 and 1. "
+            f"Invalid row indices: {invalid_rows[:10]}"
+        )
+
+    invalid_mrp = (
+        prepared_data["Product_MRP"].notna()
+        & (prepared_data["Product_MRP"] <= 0)
+    )
+
+    if invalid_mrp.any():
+        invalid_rows = prepared_data.index[invalid_mrp].tolist()
+
+        raise ValueError(
+            "Product_MRP must be greater than zero. "
+            f"Invalid row indices: {invalid_rows[:10]}"
+        )
+
+    invalid_age = (
+        prepared_data["Store_Age_Years"].notna()
+        & (prepared_data["Store_Age_Years"] < 0)
+    )
+
+    if invalid_age.any():
+        invalid_rows = prepared_data.index[invalid_age].tolist()
+
+        raise ValueError(
+            "Store_Age_Years must be zero or greater. "
+            f"Invalid row indices: {invalid_rows[:10]}"
+        )
+
+    # Reject empty categorical values.
+    empty_category_details = {}
+
     for column in CATEGORICAL_FEATURES:
-        if (
-            prepared_data[column].isna().any()
-            or prepared_data[column].eq("").any()
-        ):
-            raise ValueError(
-                f"'{column}' contains missing or blank values."
+        empty_mask = (
+            prepared_data[column].isna()
+            | prepared_data[column].astype(str).str.strip().eq("")
+        )
+
+        if empty_mask.any():
+            empty_category_details[column] = (
+                prepared_data.index[empty_mask].tolist()[:10]
             )
 
-    # Business-rule validation.
-    if (prepared_data["Product_Weight"] <= 0).any():
+    if empty_category_details:
         raise ValueError(
-            "Product_Weight must be greater than zero."
+            "Missing or empty categorical values were detected: "
+            f"{empty_category_details}"
         )
 
-    if (
-        (prepared_data["Product_Allocated_Area"] < 0)
-        | (prepared_data["Product_Allocated_Area"] > 1)
-    ).any():
-        raise ValueError(
-            "Product_Allocated_Area must be between 0 and 1."
-        )
-
-    if (prepared_data["Product_MRP"] <= 0).any():
-        raise ValueError(
-            "Product_MRP must be greater than zero."
-        )
-
-    if (prepared_data["Store_Age_Years"] < 0).any():
-        raise ValueError(
-            "Store_Age_Years cannot be negative."
+    # Unexpected columns are intentionally excluded after validation.
+    if unexpected_columns:
+        st.info(
+            "The following extra columns will not be used for prediction: "
+            + ", ".join(unexpected_columns)
         )
 
     return prepared_data
 
 
-def make_predictions(model, input_data: pd.DataFrame) -> np.ndarray:
-    """
-    Generate model predictions and verify that the results are valid.
-    """
-
-    prepared_data = prepare_input_data(input_data)
+def generate_predictions(prepared_data: pd.DataFrame) -> np.ndarray:
+    """Generate finite numeric predictions from the loaded pipeline."""
+    if not MODEL_AVAILABLE or model is None:
+        raise RuntimeError(
+            "The prediction model is not currently available."
+        )
 
     predictions = np.asarray(
         model.predict(prepared_data),
         dtype=float,
     ).reshape(-1)
 
+    if len(predictions) != len(prepared_data):
+        raise ValueError(
+            "The number of predictions does not match "
+            "the number of input records."
+        )
+
     if not np.isfinite(predictions).all():
         raise ValueError(
-            "The model generated an invalid prediction."
+            "The model returned one or more invalid predictions."
         )
 
     return predictions
 
 
-# ============================================================
-# 6. Load Model
-# ============================================================
-
-try:
-    model = load_model()
-    metadata = load_metadata()
-
-except Exception as error:
-    st.error("The SuperKart model could not be loaded.")
-    st.code(str(error))
-    st.info(
-        "Ensure that app.py and superkart_model.joblib "
-        "are saved in the same folder."
-    )
-    st.stop()
+def create_blank_template() -> bytes:
+    """Create a blank CSV template containing the expected columns."""
+    template = pd.DataFrame(columns=EXPECTED_FEATURES)
+    return template.to_csv(index=False).encode("utf-8")
 
 
-# ============================================================
-# 7. Sidebar
-# ============================================================
-
-with st.sidebar:
-    st.header("🛒 SuperKart")
-
-    st.success("Model loaded successfully")
-
-    st.markdown("---")
-
-    page = st.radio(
-        "Select prediction mode",
-        options=[
-            "Single Prediction",
-            "Batch Prediction",
-            "About the Model",
-        ],
-    )
-
-    st.markdown("---")
-
-    st.caption(
-        "This application estimates product-store sales using "
-        "a trained machine-learning pipeline."
-    )
-
-
-# ============================================================
-# 8. Header
-# ============================================================
-
-st.markdown(
-    '<div class="main-title">🛒 SuperKart Sales Predictor</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="sub-title">
-        Predict product-store sales using product and store information.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# 9. Single Prediction Page
-# ============================================================
-
-if page == "Single Prediction":
-
-    st.subheader("Single Product Sales Prediction")
-
-    st.write(
-        "Enter the product and store information below. "
-        "Then click **Predict Sales**."
-    )
-
-    with st.expander(
-        "ℹ️ How should I fill out this form?",
-        expanded=False,
-    ):
-        st.markdown(
-            """
-            - **Product Weight:** Weight of the product.
-            - **Sugar Content:** Product sugar-content category.
-            - **Allocated Area:** Store display-area ratio between 0 and 1.
-            - **Product MRP:** Maximum retail price of the product.
-            - **Store Size:** Small, Medium or High.
-            - **City Tier:** Tier 1, Tier 2 or Tier 3.
-            - **Store Type:** Type of retail store.
-            - **Product ID Prefix:** First two letters of the product ID.
-            - **Store Age:** Number of years since store establishment.
-            - **Product Category:** Perishable or non-perishable.
-            """
-        )
-
-    with st.form("single_prediction_form"):
-
-        st.markdown("### Product Information")
-
-        product_column_1, product_column_2 = st.columns(2)
-
-        with product_column_1:
-            product_weight = st.number_input(
-                "Product Weight",
-                min_value=0.01,
-                max_value=100.00,
-                value=12.66,
-                step=0.01,
-                help="Enter the weight of the product.",
-            )
-
-            product_sugar_content = st.selectbox(
-                "Product Sugar Content",
-                options=[
-                    "Low Sugar",
-                    "Regular",
-                    "No Sugar",
-                ],
-            )
-
-            product_allocated_area = st.number_input(
-                "Product Allocated Area",
-                min_value=0.000,
-                max_value=1.000,
-                value=0.027,
-                step=0.001,
-                format="%.3f",
-                help="Enter a value between 0 and 1.",
-            )
-
-        with product_column_2:
-            product_mrp = st.number_input(
-                "Product MRP",
-                min_value=0.01,
-                max_value=10000.00,
-                value=117.08,
-                step=0.01,
-            )
-
-            product_id_prefix = st.selectbox(
-                "Product ID Prefix",
-                options=[
-                    "FD",
-                    "DR",
-                    "NC",
-                ],
-                help=(
-                    "FD = Food, DR = Drinks, "
-                    "NC = Non-consumable"
-                ),
-            )
-
-            product_type_category = st.selectbox(
-                "Product Type Category",
-                options=[
-                    "Perishables",
-                    "Non Perishables",
-                ],
-            )
-
-        st.markdown("### Store Information")
-
-        store_column_1, store_column_2 = st.columns(2)
-
-        with store_column_1:
-            store_size = st.selectbox(
-                "Store Size",
-                options=[
-                    "Small",
-                    "Medium",
-                    "High",
-                ],
-                index=1,
-            )
-
-            city_type = st.selectbox(
-                "Store Location City Type",
-                options=[
-                    "Tier 1",
-                    "Tier 2",
-                    "Tier 3",
-                ],
-                index=1,
-            )
-
-        with store_column_2:
-            store_type = st.selectbox(
-                "Store Type",
-                options=[
-                    "Departmental Store",
-                    "Food Mart",
-                    "Supermarket Type1",
-                    "Supermarket Type2",
-                ],
-                index=3,
-            )
-
-            store_age = st.number_input(
-                "Store Age in Years",
-                min_value=0,
-                max_value=100,
-                value=16,
-                step=1,
-                help=(
-                    "The model was developed using a fixed "
-                    "reference year of 2025."
-                ),
-            )
-
-        submitted = st.form_submit_button(
-            "🔮 Predict Sales",
-            use_container_width=True,
-            type="primary",
-        )
-
-    if submitted:
-
-        single_input = pd.DataFrame(
-            [
-                {
-                    "Product_Weight": product_weight,
-                    "Product_Sugar_Content": product_sugar_content,
-                    "Product_Allocated_Area": product_allocated_area,
-                    "Product_MRP": product_mrp,
-                    "Store_Size": store_size,
-                    "Store_Location_City_Type": city_type,
-                    "Store_Type": store_type,
-                    "Product_Id_char": product_id_prefix,
-                    "Store_Age_Years": store_age,
-                    "Product_Type_Category": product_type_category,
-                }
-            ],
-            columns=EXPECTED_FEATURES,
-        )
-
-        try:
-            with st.spinner("Generating sales prediction..."):
-                prediction = make_predictions(
-                    model,
-                    single_input,
-                )[0]
-
-            st.markdown(
-                f"""
-                <div class="prediction-box">
-                    <div>Predicted Product-Store Sales</div>
-                    <div class="prediction-value">
-                        ₹{prediction:,.2f}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            with st.expander("View submitted input"):
-                st.dataframe(
-                    single_input,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            st.caption(
-                "This is a model estimate based on historical data. "
-                "Actual sales can be affected by demand, seasonality, "
-                "competition, promotions and market conditions."
-            )
-
-        except Exception as error:
-            st.error("The prediction could not be completed.")
-            st.code(str(error))
-
-
-# ============================================================
-# 10. Batch Prediction Page
-# ============================================================
-
-elif page == "Batch Prediction":
-
-    st.subheader("Batch Sales Prediction")
-
-    st.write(
-        "Upload a CSV file containing multiple product-store records."
-    )
-
-    st.markdown(
-        """
-        <div class="info-box">
-            The uploaded CSV must contain the exact ten model-input
-            columns shown below. Extra columns are allowed but will not
-            be used for prediction.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("### Required CSV Columns")
-
-    required_columns_table = pd.DataFrame(
-        {
-            "Position": range(1, len(EXPECTED_FEATURES) + 1),
-            "Required Column": EXPECTED_FEATURES,
-            "Type": [
-                (
-                    "Numerical"
-                    if feature in NUMERICAL_FEATURES
-                    else "Categorical"
-                )
-                for feature in EXPECTED_FEATURES
-            ],
-        }
-    )
-
-    st.dataframe(
-        required_columns_table,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    template_data = pd.DataFrame(
+def create_example_template() -> bytes:
+    """Create a one-row example CSV for batch prediction."""
+    example = pd.DataFrame(
         [
             {
                 "Product_Weight": 12.66,
@@ -641,238 +405,580 @@ elif page == "Batch Prediction":
                 "Store_Age_Years": 16,
                 "Product_Type_Category": "Non Perishables",
             }
-        ],
-        columns=EXPECTED_FEATURES,
+        ]
     )
 
-    template_csv = template_data.to_csv(index=False).encode("utf-8")
+    return example.to_csv(index=False).encode("utf-8")
 
-    st.download_button(
-        label="⬇️ Download CSV Template",
-        data=template_csv,
-        file_name="superkart_batch_template.csv",
-        mime="text/csv",
+
+# ============================================================
+# 4. Header
+# ============================================================
+
+st.title(APP_TITLE)
+
+st.markdown(
+    """
+    Predict quarterly product-store sales revenue using product
+    characteristics and store attributes.
+
+    The application uses a serialized machine learning pipeline that
+    performs preprocessing and prediction consistently.
+    """
+)
+
+st.info(
+    "The prediction is a decision-support estimate and does not "
+    "guarantee future sales revenue."
+)
+
+
+# ============================================================
+# 5. Sidebar
+# ============================================================
+
+with st.sidebar:
+    st.header("Application Information")
+
+    if MODEL_AVAILABLE:
+        st.success("Prediction model loaded")
+    else:
+        st.error("Prediction model unavailable")
+
+    st.write(f"**Target:** `{TARGET_NAME}`")
+    st.write(f"**Expected features:** {len(EXPECTED_FEATURES)}")
+    st.write("**Deployment:** Streamlit Community Cloud")
+
+    if model_metadata:
+        st.divider()
+        st.subheader("Model Metadata")
+
+        final_model_name = (
+            model_metadata.get("final_model_name")
+            or model_metadata.get("model_name")
+            or model_metadata.get("Final model name")
+        )
+
+        primary_metric = (
+            model_metadata.get("primary_metric")
+            or model_metadata.get("Primary metric")
+        )
+
+        if final_model_name:
+            st.write(f"**Model:** {final_model_name}")
+
+        if primary_metric:
+            st.write(f"**Primary metric:** {primary_metric}")
+
+    st.divider()
+
+    with st.expander("Expected input fields"):
+        for feature_number, feature in enumerate(
+            EXPECTED_FEATURES,
+            start=1,
+        ):
+            st.write(f"{feature_number}. `{feature}`")
+
+    st.caption(
+        "No manual encoding is required. The serialized pipeline "
+        "handles preprocessing internally."
     )
+
+
+# Stop only after showing a useful model-loading error.
+
+if not MODEL_AVAILABLE:
+    st.error(
+        "The application could not load the prediction model."
+    )
+
+    st.code(
+        MODEL_ERROR or "Unknown model-loading error",
+        language="text",
+    )
+
+    st.warning(
+        "Verify that `superkart_model.joblib` is present in the same "
+        "GitHub directory as `app.py`, and that requirements.txt "
+        "contains the required package versions."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# 6. Prediction tabs
+# ============================================================
+
+single_tab, batch_tab, information_tab = st.tabs(
+    [
+        "Single Prediction",
+        "Batch Prediction",
+        "Model Information",
+    ]
+)
+
+
+# ============================================================
+# 7. Single prediction
+# ============================================================
+
+with single_tab:
+    st.subheader("Single Product-Store Prediction")
+
+    st.write(
+        "Enter the product and store information below. "
+        "All required preprocessing is performed by the saved model pipeline."
+    )
+
+    with st.form("single_prediction_form"):
+        column_1, column_2 = st.columns(2)
+
+        with column_1:
+            product_weight = st.number_input(
+                "Product Weight",
+                min_value=0.01,
+                value=12.66,
+                step=0.01,
+                format="%.2f",
+                help="Weight of the product. The value must be positive.",
+            )
+
+            product_sugar_content = st.selectbox(
+                "Product Sugar Content",
+                options=CATEGORY_OPTIONS["Product_Sugar_Content"],
+                index=0,
+            )
+
+            product_allocated_area = st.number_input(
+                "Product Allocated Area",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.027,
+                step=0.001,
+                format="%.3f",
+                help="Proportion of store area allocated to the product.",
+            )
+
+            product_mrp = st.number_input(
+                "Product MRP",
+                min_value=0.01,
+                value=117.08,
+                step=0.01,
+                format="%.2f",
+                help="Maximum retail price of the product.",
+            )
+
+            product_id_char = st.selectbox(
+                "Product ID Category",
+                options=CATEGORY_OPTIONS["Product_Id_char"],
+                index=0,
+                help="Two-character product-family prefix.",
+            )
+
+        with column_2:
+            store_size = st.selectbox(
+                "Store Size",
+                options=CATEGORY_OPTIONS["Store_Size"],
+                index=1,
+            )
+
+            store_city_type = st.selectbox(
+                "Store Location City Type",
+                options=CATEGORY_OPTIONS[
+                    "Store_Location_City_Type"
+                ],
+                index=1,
+            )
+
+            store_type = st.selectbox(
+                "Store Type",
+                options=CATEGORY_OPTIONS["Store_Type"],
+                index=2,
+            )
+
+            store_age_years = st.number_input(
+                "Store Age in Years",
+                min_value=0,
+                value=16,
+                step=1,
+                help="Store age calculated using the project reference year.",
+            )
+
+            product_type_category = st.selectbox(
+                "Product Type Category",
+                options=CATEGORY_OPTIONS["Product_Type_Category"],
+                index=1,
+            )
+
+        submitted = st.form_submit_button(
+            "Predict Sales Revenue",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        single_payload = {
+            "Product_Weight": float(product_weight),
+            "Product_Sugar_Content": product_sugar_content,
+            "Product_Allocated_Area": float(
+                product_allocated_area
+            ),
+            "Product_MRP": float(product_mrp),
+            "Store_Size": store_size,
+            "Store_Location_City_Type": store_city_type,
+            "Store_Type": store_type,
+            "Product_Id_char": product_id_char,
+            "Store_Age_Years": int(store_age_years),
+            "Product_Type_Category": product_type_category,
+        }
+
+        try:
+            single_input = pd.DataFrame([single_payload])
+            prepared_single_input = prepare_input_dataframe(
+                single_input
+            )
+
+            with st.spinner("Generating the sales prediction..."):
+                single_prediction = generate_predictions(
+                    prepared_single_input
+                )[0]
+
+            st.success("Prediction generated successfully.")
+
+            metric_column, records_column = st.columns(2)
+
+            with metric_column:
+                st.metric(
+                    label="Predicted Product-Store Sales Revenue",
+                    value=f"{single_prediction:,.2f}",
+                )
+
+            with records_column:
+                st.metric(
+                    label="Records Processed",
+                    value="1",
+                )
+
+            with st.expander("Submitted input"):
+                display_input = prepared_single_input.copy()
+                st.dataframe(
+                    display_input,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            st.caption(
+                "The displayed prediction has been rounded to two decimal "
+                "places. The model calculation uses the full numeric value."
+            )
+
+        except Exception as error:
+            st.error(
+                "The prediction could not be generated. "
+                f"Please review the input values. Details: {error}"
+            )
+
+
+# ============================================================
+# 8. Batch prediction
+# ============================================================
+
+with batch_tab:
+    st.subheader("Batch Sales Prediction")
+
+    st.write(
+        "Upload a CSV file containing the ten required model features. "
+        "The uploaded file must not contain the target value."
+    )
+
+    template_column, example_column = st.columns(2)
+
+    with template_column:
+        st.download_button(
+            label="Download Blank CSV Template",
+            data=create_blank_template(),
+            file_name="superkart_batch_template.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with example_column:
+        st.download_button(
+            label="Download Example CSV",
+            data=create_example_template(),
+            file_name="superkart_batch_example.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with st.expander("Required CSV columns"):
+        st.code(
+            "\n".join(EXPECTED_FEATURES),
+            language="text",
+        )
 
     uploaded_file = st.file_uploader(
-        "Upload your batch CSV file",
+        "Upload the batch CSV file",
         type=["csv"],
-        help="Maximum recommended size: 10,000 rows.",
+        help=f"Maximum supported batch size: {MAX_BATCH_ROWS:,} rows.",
     )
 
     if uploaded_file is not None:
-
         try:
             batch_data = pd.read_csv(uploaded_file)
 
-            if batch_data.empty:
-                st.warning("The uploaded CSV file contains no rows.")
-                st.stop()
+            file_column, row_column, feature_column = st.columns(3)
 
-            st.success(
-                f"CSV uploaded successfully: "
-                f"{len(batch_data):,} row(s)"
-            )
+            with file_column:
+                st.metric(
+                    "Filename",
+                    uploaded_file.name,
+                )
 
-            st.markdown("### Uploaded Data Preview")
+            with row_column:
+                st.metric(
+                    "Rows",
+                    f"{len(batch_data):,}",
+                )
+
+            with feature_column:
+                st.metric(
+                    "Columns",
+                    len(batch_data.columns),
+                )
+
+            st.write("#### Uploaded Data Preview")
 
             st.dataframe(
-                batch_data.head(10),
+                batch_data.head(),
                 use_container_width=True,
                 hide_index=True,
             )
 
-            is_valid, missing_columns = validate_schema(batch_data)
-
-            if not is_valid:
-                st.error(
-                    "The CSV cannot be processed because required "
-                    "columns are missing."
+            if len(batch_data) > MAX_BATCH_ROWS:
+                raise ValueError(
+                    f"The uploaded file contains {len(batch_data):,} rows. "
+                    f"The maximum supported batch size is "
+                    f"{MAX_BATCH_ROWS:,} rows."
                 )
 
-                st.write("Missing columns:")
+            missing_columns, unexpected_columns = (
+                validate_feature_schema(batch_data)
+            )
 
-                for column in missing_columns:
-                    st.write(f"- `{column}`")
-
-            elif len(batch_data) > 10000:
+            if missing_columns:
                 st.error(
-                    "The uploaded CSV contains more than 10,000 rows. "
-                    "Please upload a smaller file."
+                    "Missing required columns: "
+                    + ", ".join(missing_columns)
                 )
 
-            else:
-                if st.button(
-                    "🔮 Generate Batch Predictions",
-                    use_container_width=True,
+            if unexpected_columns:
+                st.warning(
+                    "The following additional columns will be excluded "
+                    "from prediction: "
+                    + ", ".join(unexpected_columns)
+                )
+
+            if not missing_columns:
+                prepared_batch_data = prepare_input_dataframe(
+                    batch_data
+                )
+
+                st.success(
+                    "The uploaded CSV passed schema validation."
+                )
+
+                predict_batch = st.button(
+                    "Generate Batch Predictions",
                     type="primary",
-                ):
+                    use_container_width=True,
+                )
+
+                if predict_batch:
                     with st.spinner(
-                        "Generating batch predictions..."
+                        f"Generating predictions for "
+                        f"{len(prepared_batch_data):,} records..."
                     ):
-                        predictions = make_predictions(
-                            model,
-                            batch_data,
+                        batch_predictions = generate_predictions(
+                            prepared_batch_data
                         )
 
-                    result_data = batch_data.copy()
-                    result_data[PREDICTION_COLUMN] = predictions.round(2)
+                    batch_results = batch_data.copy()
+
+                    batch_results[
+                        "Predicted_Product_Store_Sales_Total"
+                    ] = batch_predictions
 
                     st.success(
                         f"Predictions generated successfully for "
-                        f"{len(result_data):,} record(s)."
+                        f"{len(batch_results):,} records."
                     )
 
-                    metric_column_1, metric_column_2 = st.columns(2)
+                    result_column, prediction_column = st.columns(2)
 
-                    with metric_column_1:
+                    with result_column:
                         st.metric(
                             "Records Processed",
-                            f"{len(result_data):,}",
+                            f"{len(batch_results):,}",
                         )
 
-                    with metric_column_2:
+                    with prediction_column:
                         st.metric(
-                            "Average Predicted Sales",
-                            f"₹{predictions.mean():,.2f}",
+                            "Predictions Generated",
+                            f"{len(batch_predictions):,}",
                         )
 
-                    st.markdown("### Prediction Results")
+                    st.write("#### Prediction Results Preview")
 
                     st.dataframe(
-                        result_data.head(50),
+                        batch_results.head(10),
                         use_container_width=True,
                         hide_index=True,
                     )
 
-                    result_csv = result_data.to_csv(
+                    result_csv = batch_results.to_csv(
                         index=False
                     ).encode("utf-8")
 
                     st.download_button(
-                        label="⬇️ Download Prediction Results",
+                        label="Download Batch Prediction Results",
                         data=result_csv,
                         file_name="superkart_batch_predictions.csv",
                         mime="text/csv",
+                        type="primary",
                         use_container_width=True,
                     )
 
-                    st.caption(
-                        "The preview displays the first 50 rows. "
-                        "The downloaded CSV contains all records."
+                    st.info(
+                        "The batch data does not contain actual target "
+                        "values. Therefore, evaluation metrics such as "
+                        "RMSE, MAE, and R-squared are not calculated."
                     )
 
         except pd.errors.EmptyDataError:
-            st.error("The uploaded CSV file is empty.")
+            st.error(
+                "The uploaded CSV is empty or does not contain readable data."
+            )
 
         except pd.errors.ParserError:
             st.error(
-                "The uploaded file could not be read as a valid CSV."
+                "The uploaded file could not be parsed as a valid CSV."
+            )
+
+        except UnicodeDecodeError:
+            st.error(
+                "The CSV encoding could not be read. "
+                "Please upload a UTF-8 encoded CSV file."
             )
 
         except Exception as error:
-            st.error("Batch prediction could not be completed.")
-            st.code(str(error))
+            st.error(
+                "Batch validation or prediction failed. "
+                f"Details: {error}"
+            )
 
 
 # ============================================================
-# 11. About Page
+# 9. Model information
 # ============================================================
 
-elif page == "About the Model":
-
-    st.subheader("About the SuperKart Model")
+with information_tab:
+    st.subheader("Model and Deployment Information")
 
     information_column_1, information_column_2 = st.columns(2)
 
     with information_column_1:
-        st.markdown(
-            """
-            ### Model Purpose
+        st.write("#### Application")
 
-            The application estimates product-store sales using
-            product characteristics and store characteristics.
-
-            ### Final Model
-
-            The selected model is a **tuned Random Forest regressor**
-            bundled together with its preprocessing pipeline.
-            """
-        )
+        st.write(f"**Application:** {APP_TITLE}")
+        st.write(f"**Prediction target:** `{TARGET_NAME}`")
+        st.write("**Interface:** Streamlit")
+        st.write("**Inference type:** Single and batch")
+        st.write("**Model file:** `superkart_model.joblib`")
 
     with information_column_2:
-        st.markdown(
-            """
-            ### Model Inputs
+        st.write("#### Model Status")
 
-            The model accepts:
-
-            - Four numerical features
-            - Six categorical features
-            - Ten total input features
-
-            Preprocessing is performed automatically by the saved
-            machine-learning pipeline.
-            """
+        st.write(
+            f"**Model loaded:** {'Yes' if MODEL_AVAILABLE else 'No'}"
         )
 
-    st.markdown("---")
+        if model is not None:
+            st.write(
+                f"**Loaded object:** `{type(model).__name__}`"
+            )
 
-    st.markdown("### Model Performance")
+            if hasattr(model, "named_steps"):
+                pipeline_steps = list(model.named_steps.keys())
 
-    metric_column_1, metric_column_2, metric_column_3 = st.columns(3)
+                st.write(
+                    "**Pipeline steps:** "
+                    + ", ".join(pipeline_steps)
+                )
 
-    with metric_column_1:
-        st.metric(
-            "Test RMSE",
-            "277.00",
-        )
+    st.divider()
 
-    with metric_column_2:
-        st.metric(
-            "Test MAE",
-            "107.75",
-        )
+    st.write("#### Expected Feature Schema")
 
-    with metric_column_3:
-        st.metric(
-            "Test R²",
-            "0.9328",
-        )
+    feature_schema = pd.DataFrame(
+        {
+            "Feature": EXPECTED_FEATURES,
+            "Type": [
+                (
+                    "Numerical"
+                    if feature in NUMERICAL_FEATURES
+                    else "Categorical"
+                )
+                for feature in EXPECTED_FEATURES
+            ],
+            "Required": ["Yes"] * len(EXPECTED_FEATURES),
+        }
+    )
 
-    st.markdown("---")
+    st.dataframe(
+        feature_schema,
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    st.markdown("### Technical Information")
+    if model_metadata:
+        st.divider()
+        st.write("#### Saved Model Metadata")
 
-    technical_information = {
-        "Model artifact": MODEL_FILE,
-        "Pipeline structure": "Preprocessor + Random Forest",
-        "Number of input features": len(EXPECTED_FEATURES),
-        "Target": "Product_Store_Sales_Total",
-        "Deployment": "Streamlit Community Cloud",
-        "Backend API": "Not required",
-        "Hugging Face": "Not used",
-    }
+        safe_metadata = {
+            key: value
+            for key, value in model_metadata.items()
+            if not any(
+                sensitive_word in key.lower()
+                for sensitive_word in [
+                    "token",
+                    "password",
+                    "secret",
+                    "credential",
+                ]
+            )
+        }
 
-    st.json(technical_information)
+        st.json(safe_metadata)
 
-    if metadata:
-        with st.expander("View saved model metadata"):
-            st.json(metadata)
+    st.divider()
 
     st.warning(
-        "This application provides statistical estimates. "
-        "Predictions do not guarantee future sales because real sales "
-        "may be affected by conditions not included in the dataset."
+        "The model predicts product-store sales revenue rather than "
+        "physical unit demand. Inventory decisions should also consider "
+        "current stock, unit prices, supplier lead times, shelf life, "
+        "promotions, and operational constraints."
     )
 
 
 # ============================================================
-# 12. Footer
+# 10. Footer
 # ============================================================
 
-st.markdown("---")
+st.divider()
 
 st.caption(
-    "SuperKart Sales Prediction | Machine Learning Regression Project"
+    "SuperKart Sales Forecasting System | "
+    "Machine Learning Model Deployment Project"
 )
